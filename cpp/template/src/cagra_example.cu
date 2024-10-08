@@ -21,18 +21,17 @@
 #include <raft/neighbors/cagra.cuh>
 #include <raft/random/make_blobs.cuh>
 
+#include <rmm/mr/device/cuda_memory_resource.hpp>
 #include <rmm/mr/device/device_memory_resource.hpp>
-#include <rmm/mr/device/pool_memory_resource.hpp>
 
 #include <cstdint>
 
 void cagra_build_search_simple(raft::device_resources const& dev_resources,
                                raft::device_matrix_view<const float, int64_t> dataset,
-                               raft::device_matrix_view<const float, int64_t> queries)
+                               raft::device_matrix_view<const float, int64_t> queries,
+                               int64_t topk)
 {
   using namespace raft::neighbors;
-
-  int64_t topk      = 12;
   int64_t n_queries = queries.extent(0);
 
   // create output arrays
@@ -42,50 +41,58 @@ void cagra_build_search_simple(raft::device_resources const& dev_resources,
   // use default index parameters
   cagra::index_params index_params;
 
-  std::cout << "Building CAGRA index (search graph)" << std::endl;
+  auto s = std::chrono::high_resolution_clock::now();
   auto index = cagra::build<float, uint32_t>(dev_resources, index_params, dataset);
+  auto e = std::chrono::high_resolution_clock::now();
+  std::cout << "CAGRA index built in " << std::chrono::duration_cast<std::chrono::milliseconds>(e - s).count()
+            << " ms" << std::endl;
 
   std::cout << "CAGRA index has " << index.size() << " vectors" << std::endl;
   std::cout << "CAGRA graph has degree " << index.graph_degree() << ", graph size ["
             << index.graph().extent(0) << ", " << index.graph().extent(1) << "]" << std::endl;
 
-  // use default search parameters
   cagra::search_params search_params;
-  // search K nearest neighbors
+  s = std::chrono::high_resolution_clock::now();
   cagra::search<float, uint32_t>(
     dev_resources, search_params, index, queries, neighbors.view(), distances.view());
-
-  // The call to ivf_flat::search is asynchronous. Before accessing the data, sync by calling
-  // raft::resource::sync_stream(dev_resources);
+  e = std::chrono::high_resolution_clock::now();
+  std::cout << "CAGRA search completed in "
+            << std::chrono::duration_cast<std::chrono::milliseconds>(e - s).count() << " ms" << std::endl;
 
   print_results(dev_resources, neighbors.view(), distances.view());
 }
 
-int main()
+int main(int argc, char** argv)
 {
+  if (argc != 5) {
+    std::cerr << "Usage: " << argv[0] << " <n_samples> <n_queries> <n_dim> <top_k>" << std::endl;
+    return 1;
+  }
+  
+  // Set the device memory resource to the CUDA memory resource.
   raft::device_resources dev_resources;
+  rmm::mr::cuda_memory_resource cuda_mr;
+  rmm::mr::set_current_device_resource(&cuda_mr);
 
-  // Set pool memory resource with 1 GiB initial pool size. All allocations use the same pool.
-  rmm::mr::pool_memory_resource<rmm::mr::device_memory_resource> pool_mr(
-    rmm::mr::get_current_device_resource(), 1024 * 1024 * 1024ull);
-  rmm::mr::set_current_device_resource(&pool_mr);
+  int64_t n_samples = std::atoi(argv[1]);
+  int64_t n_queries = std::atoi(argv[2]);
+  int64_t n_dim     = std::atoi(argv[3]);
+  int64_t top_k     = std::atoi(argv[4]);
+  std::cout << "n_samples: " << n_samples << ", n_queries: " << n_queries << ", n_dim: " << n_dim
+            << ", top_k: " << top_k << std::endl;
 
-  // Alternatively, one could define a pool allocator for temporary arrays (used within RAFT
-  // algorithms). In that case only the internal arrays would use the pool, any other allocation
-  // uses the default RMM memory resource. Here is how to change the workspace memory resource to
-  // a pool with 2 GiB upper limit.
-  // raft::resource::set_workspace_to_pool_resource(dev_resources, 2 * 1024 * 1024 * 1024ull);
-
-  // Create input arrays.
-  int64_t n_samples = 10000;
-  int64_t n_dim     = 90;
-  int64_t n_queries = 10;
+  // Generate the dataset and queries.
   auto dataset      = raft::make_device_matrix<float, int64_t>(dev_resources, n_samples, n_dim);
   auto queries      = raft::make_device_matrix<float, int64_t>(dev_resources, n_queries, n_dim);
+  auto s = std::chrono::high_resolution_clock::now();
   generate_dataset(dev_resources, dataset.view(), queries.view());
+  auto e = std::chrono::high_resolution_clock::now();
+  std::cout << "Data generated in " << std::chrono::duration_cast<std::chrono::milliseconds>(e - s).count()
+            << " ms" << std::endl;
 
   // Simple build and search example.
   cagra_build_search_simple(dev_resources,
                             raft::make_const_mdspan(dataset.view()),
-                            raft::make_const_mdspan(queries.view()));
+                            raft::make_const_mdspan(queries.view()),
+                            top_k);
 }
